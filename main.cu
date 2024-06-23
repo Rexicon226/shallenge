@@ -1,201 +1,181 @@
 #include <cuda.h>
 #include <stdio.h>
 #include <string.h>
-
 #include <chrono>
-#include <cstdint>
 
 #include "sha256.cuh"
+#include "helper.cuh"
 
-#define BLOCK_SIZE 256
-#define GRID_SIZE 4096
-#define ITEMS_PER_THREAD 1024
+#define BLOCK_SIZE 1024
+#define GRID_SIZE 5120
+#define ITEMS_PER_THREAD 32
 
-#define __both__ __host__ __device__
-
-__device__ const char *baseline = "telaxion/zig+2070super+";
+const char *h_baseline = "telaxion/zig+2070super+";
+__device__ const char *d_baseline = "telaxion/zig+2070super+";
 __device__ const int baseline_len = 23;
 
-__both__ void memcpyHash(BYTE *dest, BYTE *src, int len) {
-    for (int i = 0; i < len; i++) {
-        dest[i] = src[i];
-    }
-}
-
-__both__ int memcmpHash(BYTE *a, BYTE *b, int len) {
-    for (int i = 0; i < len; i++) {
-        if (a[i] < b[i]) {
-            return -1;
-        } else if (a[i] > b[i]) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/// Creates a unique input string. Returns the length of the string.
-__device__ int input_string(int epoch, int tid, int bid, int item,
-                            BYTE *output) {
-    uint elo = (epoch & 0x0F0F0F0F) + 0x61616161;
-    uint ehi = ((epoch & 0xF0F0F0F0) >> 4) + 0x62626262;
-
-    BYTE nonce[8];
-    nonce[0] = (BYTE)('a' + ((bid >> 12) & 0xF));
-    nonce[1] = (BYTE)('a' + ((bid >> 8) & 0xF));
-    nonce[2] = (BYTE)('a' + ((bid >> 4) & 0xF));
-    nonce[3] = (BYTE)('a' + (bid & 0xF));
-    nonce[4] = (BYTE)('a' + ((tid >> 4) & 0xF));
-    nonce[5] = (BYTE)('a' + (tid & 0xF));
-    nonce[6] = (BYTE)('a' + ((item >> 4) & 0xF));
-    nonce[7] = (BYTE)('a' + (item & 0xF));
-
-    // concat baseline + ehi + elo + nonce
+__both__ int input_string(int epoch, int tid, int bid, int item,
+                          char *output) {
     int len = 0;
-    for (int i = 0; i < baseline_len; i++) {
-        output[len++] = baseline[i];
-    }
 
-    output[len++] = (char)((ehi >> 24) & 0xFF);
-    output[len++] = (char)((ehi >> 16) & 0xFF);
-    output[len++] = (char)((ehi >> 8) & 0xFF);
-    output[len++] = (char)((ehi >> 0) & 0xFF);
+    #if defined(__CUDA_ARCH__)
+        memcpy(output, d_baseline, baseline_len);
+    #else
+        memcpy(output, h_baseline, baseline_len);
+    #endif    
 
-    output[len++] = (char)((elo >> 24) & 0xFF);
-    output[len++] = (char)((elo >> 16) & 0xFF);
-    output[len++] = (char)((elo >> 8) & 0xFF);
-    output[len++] = (char)((elo >> 0) & 0xFF);
+    len += baseline_len;
 
-    for (int i = 0; i < 8; i++) {
-        output[len++] = nonce[i];
-    }
+    char nonce[16];
+    const char valid_chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const int num_valid_chars = sizeof(valid_chars) - 1;
+
+    nonce[0] = valid_chars[(epoch >> 24) % num_valid_chars];
+    nonce[1] = valid_chars[(epoch >> 16) % num_valid_chars];
+    nonce[2] = valid_chars[(epoch >> 8) % num_valid_chars];
+    nonce[3] = valid_chars[epoch % num_valid_chars];
+
+    nonce[4] = valid_chars[(tid >> 24) % num_valid_chars];
+    nonce[5] = valid_chars[(tid >> 16) % num_valid_chars];
+    nonce[6] = valid_chars[(tid >> 8) % num_valid_chars];
+    nonce[7] = valid_chars[tid % num_valid_chars];
+
+    nonce[8] = valid_chars[(bid >> 24) % num_valid_chars];
+    nonce[9] = valid_chars[(bid >> 16) % num_valid_chars];
+    nonce[10] = valid_chars[(bid >> 8) % num_valid_chars];
+    nonce[11] = valid_chars[bid % num_valid_chars];
+
+    nonce[12] = valid_chars[(item >> 24) % num_valid_chars];
+    nonce[13] = valid_chars[(item >> 16) % num_valid_chars];
+    nonce[14] = valid_chars[(item >> 8) % num_valid_chars];
+    nonce[15] = valid_chars[item % num_valid_chars];
+
+    memcpy(output + len, nonce, 16);
+    len += 16;
 
     return len;
 }
 
-__both__ void print_hash(BYTE *hash) {
-    for (int i = 0; i < 32; i++) {
-        printf("%02x", hash[i]);
+
+__device__ BYTE s_totalHash[BLOCK_SIZE][SHA256_BLOCK_SIZE];
+__device__ int s_inputString[BLOCK_SIZE][3];
+
+__device__ inline void findHash(int epoch, int threadIdx, int blockIdx, int seed, BYTE *smallestHash, int *smallestInput) {
+    char input[baseline_len + 16];
+    int len = input_string(epoch, threadIdx, blockIdx, seed, input);
+
+    SHA256_CTX ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, (BYTE *)input, len);
+
+    BYTE digest[SHA256_BLOCK_SIZE];
+    sha256_final(&ctx, digest);
+
+    int compare = memcmpHash<32>(digest, smallestHash);
+    if (compare < 0) {
+        memcpy(smallestHash, digest, SHA256_BLOCK_SIZE);
+        smallestInput[0] = threadIdx;
+        smallestInput[1] = blockIdx;
+        smallestInput[2] = seed;
     }
 }
 
-__device__ BYTE global_smallestHash[SHA256_BLOCK_SIZE] = {0xFF};
-__device__ BYTE global_smallestInput[128];
-
-__both__ uint64_t byteswap64(uint64_t x) {
-    return ((x & 0x00000000000000FFULL) << 56) |
-           ((x & 0x000000000000FF00ULL) << 40) |
-           ((x & 0x0000000000FF0000ULL) << 24) |
-           ((x & 0x00000000FF000000ULL) << 8) |
-           ((x & 0x000000FF00000000ULL) >> 8) |
-           ((x & 0x0000FF0000000000ULL) >> 24) |
-           ((x & 0x00FF000000000000ULL) >> 40) |
-           ((x & 0xFF00000000000000ULL) >> 56);
+__global__ void setup() {
+    memset(s_totalHash, 0xFF, sizeof(s_totalHash));
 }
 
-__device__ volatile int sem = 0;
+__global__ void kernel(int epoch, BYTE *d_totalHash, int *d_inputString) {
+    __shared__ BYTE s_smallestHash[SHA256_BLOCK_SIZE];
+    __shared__ int s_smallestInput[3];
 
-__device__ void acquire_semaphore(volatile int *lock) {
-    while (atomicCAS((int *)lock, 0, 1) != 0)
-        ;
-}
+    if (threadIdx.x == 0) {
+        memset(s_smallestHash, 0xFF, sizeof(s_smallestHash));
+    }
 
-__device__ void release_semaphore(volatile int *lock) {
-    *lock = 0;
-    __threadfence();
-}
+    __syncthreads();
 
-__global__ void setup() { memset(global_smallestHash, 0xFF, 32); }
-
-__global__ void sha256_cuda(int epoch) {
-    BYTE smallestHash[SHA256_BLOCK_SIZE];
-    BYTE smallestInput[128];
-    memset(smallestHash, 0xFF, 32);
-
+    BYTE *smallestHash = s_totalHash[threadIdx.x];
+    int *smallestInput = s_inputString[threadIdx.x];
+    
     for (int seed = 0; seed < ITEMS_PER_THREAD; seed++) {
-        BYTE input[128];
-        int len = input_string(epoch, threadIdx.x, blockIdx.x, seed, input);
+        findHash(epoch, threadIdx.x, blockIdx.x, seed, smallestHash, smallestInput);
+    }
 
-        SHA256_CTX ctx;
-        sha256_init(&ctx);
-        sha256_update(&ctx, (BYTE *)input, len);
+    if (threadIdx.x == 0) {
+        memcpy(s_smallestHash, smallestHash, SHA256_BLOCK_SIZE);
+        memcpy(s_smallestInput, smallestInput, 3 * sizeof(int));
+    }
 
-        BYTE digest[SHA256_BLOCK_SIZE];
-        sha256_final(&ctx, digest);
+    __syncthreads();
 
-        int compare = memcmpHash(digest, smallestHash, 32);
-        if (compare < 0) {
-            memcpy(smallestHash, digest, 32);
-            memcpy(smallestInput, input, 128);
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            int compare = memcmpHash<32>(s_totalHash[threadIdx.x], s_totalHash[threadIdx.x + s]);
+            if (compare > 0) {
+                memcpy(s_totalHash[threadIdx.x], s_totalHash[threadIdx.x + s], SHA256_BLOCK_SIZE);
+                memcpy(s_inputString[threadIdx.x], s_inputString[threadIdx.x + s], 3 * sizeof(int));
+            }
         }
+        __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        __syncthreads();
-        acquire_semaphore(&sem);
-    }
-
-    bool smaller = memcmpHash(smallestHash, global_smallestHash, 32) < 0;
-    if (smaller) {
-        memcpy(global_smallestHash, smallestHash, SHA256_BLOCK_SIZE);
-        memcpy(global_smallestInput, smallestInput, 128);
-    }
-
-    if (threadIdx.x == 0) {
-        __threadfence();
-        release_semaphore(&sem);
-        __syncthreads();
-    }
-}
-
-void printHashesPerSecond(long long hashes, double elapsedMillis) {
-    double hashesPerSecond = (hashes / (elapsedMillis / 1000.0));
-
-    if (hashesPerSecond >= 1e12) {
-        printf("%.2f TH/s\n", hashesPerSecond / 1e12);
-    } else if (hashesPerSecond >= 1e9) {
-        printf("%.2f GH/s\n", hashesPerSecond / 1e9);
-    } else if (hashesPerSecond >= 1e6) {
-        printf("%.2f MH/s\n", hashesPerSecond / 1e6);
-    } else {
-        printf("%.2f kH/s\n", hashesPerSecond / 1e3);
+        memcpy(&d_totalHash[blockIdx.x * SHA256_BLOCK_SIZE], s_totalHash[0], SHA256_BLOCK_SIZE);
+        memcpy(&d_inputString[blockIdx.x * 3], s_inputString[0], 3 * sizeof(int));
     }
 }
 
 int main() {
+    BYTE *d_totalHash;
+    int *d_inputString;
+
+    cudaMalloc((void **)&d_totalHash, GRID_SIZE * SHA256_BLOCK_SIZE * sizeof(BYTE));
+    cudaMalloc((void **)&d_inputString, GRID_SIZE * 3 * sizeof(int));
+
     setup<<<1, 1>>>();
 
-    // open out.txt for logging
-    freopen("out.txt", "w", stdout);
-
     int epoch = 0;
-    while (true) {
+    while (epoch < 10) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        sha256_cuda<<<GRID_SIZE, BLOCK_SIZE>>>(epoch);
+        kernel<<<GRID_SIZE, BLOCK_SIZE>>>(epoch, d_totalHash, d_inputString);
         cudaDeviceSynchronize();
 
         auto end = std::chrono::high_resolution_clock::now();
         double elapsedMillis =
             std::chrono::duration<double, std::milli>(end - start).count();
 
-        BYTE resultHash[SHA256_BLOCK_SIZE];
-        cudaMemcpyFromSymbol(resultHash, global_smallestHash,
-                             sizeof(BYTE) * 32);
-        print_hash(resultHash);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
+            exit(-1);
+        }
 
-        char resultInput[128];
-        cudaMemcpyFromSymbol(resultInput, global_smallestInput,
-                             sizeof(BYTE) * 128);
-        printf(" %s\n", resultInput);
+        BYTE smallestHash[SHA256_BLOCK_SIZE];
+        cudaMemcpy(smallestHash, d_totalHash, SHA256_BLOCK_SIZE, cudaMemcpyDeviceToHost);
+
+        int smallestInputString[3];
+        cudaMemcpy(smallestInputString, d_inputString, 3 * sizeof(int), cudaMemcpyDeviceToHost);
+
+        char input[baseline_len + 16];
+        input_string(epoch, smallestInputString[0], smallestInputString[1], smallestInputString[2], input);
+       
+        printf("%d: ", epoch);
+        print_hash(smallestHash);
+        printf(" %s\n", input);
+
+        printf("elapsed time: %f\n", elapsedMillis);
         
         float hashes = (float)GRID_SIZE * BLOCK_SIZE * ITEMS_PER_THREAD;
         printHashesPerSecond(hashes, elapsedMillis);
 
-        // save out.txt as it might crash next epoch
         fflush(stdout);
 
         epoch++;
     }
+
+    cudaFree(d_totalHash);
+    cudaFree(d_inputString);
 
     return 0;
 }
