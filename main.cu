@@ -140,10 +140,9 @@ int main() {
         double elapsedMillis =
             std::chrono::duration<double, std::milli>(end - start).count();
 
-        float hashes =
-            (float)GRID_SIZE * BLOCK_SIZE * ITEMS_PER_THREAD * GPU_COUNT;
-
-        printHashesPerSecond(hashes, elapsedMillis);
+        uint64_t epoch_totalHash;
+        uint64_t epoch_inputString1;
+        uint64_t epoch_inputString2;
 
         // find the global best hash, and update all d_totalHash pointers to be
         // that in order to synchronize the gpus
@@ -161,11 +160,38 @@ int main() {
             cudaMemcpy(&smallestInputString2, d_inputString2[device_id],
                        sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
-            if (current_totalHash > smallestHash) {
-                current_totalHash = smallestHash;
-                current_inputString1 = smallestInputString1;
-                current_inputString2 = smallestInputString2;
+            if (epoch_totalHash > smallestHash) {
+                epoch_totalHash = smallestHash;
+                epoch_inputString1 = smallestInputString1;
+                epoch_inputString2 = smallestInputString2;
             }
+        }
+
+        if (epoch_totalHash < current_totalHash) {
+            current_totalHash = epoch_totalHash;
+            current_inputString1 = epoch_inputString1;
+            current_inputString2 = epoch_inputString2;
+
+            float hashes =
+                (float)GRID_SIZE * BLOCK_SIZE * ITEMS_PER_THREAD * GPU_COUNT;
+
+            printHashesPerSecond(hashes, elapsedMillis);
+
+            char input[128];
+            int smallest_epoch = (int)(current_inputString2 & 0xFFFFFFFF);
+            int threadIdx = (int)((current_inputString2 >> 32) & 0xFFFFFFFF);
+            int blockIdx = (int)((current_inputString1 & 0xFFFFFFFF));
+            int seed = (int)((current_inputString1 >> 32) & 0xFFFFFFFF);
+
+            input_string(smallest_epoch, threadIdx, blockIdx, seed, input);
+
+            printf("epoch %d: | ", epoch);
+            printf("| %016lx | %s\n", current_totalHash, input);
+
+            if (current_totalHash == 0) break;
+
+            printf("elapsed time: %f\n", elapsedMillis);
+            fflush(stdout);
         }
 
         // update all d_totalHashes for the current best hash
@@ -173,22 +199,6 @@ int main() {
             cudaMemcpy(d_totalHash[device_id], &current_totalHash,
                        sizeof(uint64_t), cudaMemcpyHostToDevice);
         }
-
-        char input[128];
-        int smallest_epoch = (int)(current_inputString2 & 0xFFFFFFFF);
-        int threadIdx = (int)((current_inputString2 >> 32) & 0xFFFFFFFF);
-        int blockIdx = (int)((current_inputString1 & 0xFFFFFFFF));
-        int seed = (int)((current_inputString1 >> 32) & 0xFFFFFFFF);
-
-        input_string(smallest_epoch, threadIdx, blockIdx, seed, input);
-
-        printf("epoch %d: | ", epoch);
-        printf("| %016lx | %s\n", current_totalHash, input);
-
-        if (current_totalHash == 0) break;
-
-        printf("elapsed time: %f\n", elapsedMillis);
-        fflush(stdout);
     }
 
     cudaFree(d_totalHash);
