@@ -144,6 +144,8 @@ int main() {
         uint64_t epoch_inputString1;
         uint64_t epoch_inputString2;
 
+        memset(&epoch_totalHash, 0xFF, sizeof(uint64_t));
+
         // find the global best hash, and update all d_totalHash pointers to be
         // that in order to synchronize the gpus
 
