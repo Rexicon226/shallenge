@@ -1,5 +1,7 @@
 #include <stdio.h>
 
+#include <cmath>
+
 #include "sha256.cuh"
 
 #define __both__ __host__ __device__
@@ -24,53 +26,60 @@ inline void printHashesPerSecond(long long hashes, double elapsedMillis) {
 __device__
 #else
 #endif
-    const char valid_chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const char valid_chars[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 #if (__CUDA_ARCH__)
 __device__
 #else
 #endif
-    const char *prefix = "telaxion/zig$2070super+";
+    const char *prefix = "telaxion/zig+dgxa100+";
 
 const int num_valid_chars = sizeof(valid_chars) - 1;
 
 __both__ int input_string(int epoch, int tid, int bid, int item, char *output) {
     int len = 0;
 
-    memcpy(output, prefix, 23);
-    len += 23;
+    memcpy(output, prefix, 21);
+    len += 21;
 
-    char *nonce_ptr = output + len;
+    while (epoch > 0) {
+        int remainder = epoch % num_valid_chars;
+        output[len++] = valid_chars[remainder];
+        epoch /= num_valid_chars;
+    }
 
-    nonce_ptr[0] = valid_chars[(epoch >> 24) % num_valid_chars];
-    nonce_ptr[1] = valid_chars[(epoch >> 16) % num_valid_chars];
-    nonce_ptr[2] = valid_chars[(epoch >> 8) % num_valid_chars];
-    nonce_ptr[3] = valid_chars[epoch % num_valid_chars];
+    while (tid > 0) {
+        int remainder = tid % num_valid_chars;
+        output[len++] = valid_chars[remainder];
+        tid /= num_valid_chars;
+    }
 
-    nonce_ptr[4] = valid_chars[(tid >> 16) % num_valid_chars];
-    nonce_ptr[5] = valid_chars[(tid >> 8) % num_valid_chars];
-    nonce_ptr[6] = valid_chars[tid % num_valid_chars];
+    while (bid > 0) {
+        int remainder = bid % num_valid_chars;
+        output[len++] = valid_chars[remainder];
+        bid /= num_valid_chars;
+    }
 
-    nonce_ptr[7] = valid_chars[(bid >> 16) % num_valid_chars];
-    nonce_ptr[8] = valid_chars[(bid >> 8) % num_valid_chars];
-    nonce_ptr[9] = valid_chars[bid % num_valid_chars];
+    while (item > 0) {
+        int remainder = item % num_valid_chars;
+        output[len++] = valid_chars[remainder];
+        item /= num_valid_chars;
+    }
 
-    nonce_ptr[10] = valid_chars[(item >> 8) % num_valid_chars];
-    nonce_ptr[11] = valid_chars[item % num_valid_chars];
-
-    len += 12;
+    output[len] = '\0';
 
     return len;
 }
 
 __device__ void hashSeed(int epoch, int threadIdx, int blockIdx, int seed,
                          BYTE *digest) {
-    char input[35];
+    char input[128];
     int len = input_string(epoch, threadIdx, blockIdx, seed, input);
 
     SHA256_CTX ctx;
     sha256_init(&ctx);
-    sha256_updateUnrolled(&ctx, (BYTE *)input);
+    sha256_update(&ctx, (BYTE *)input, len);
 
     sha256_final(&ctx, digest);
 }

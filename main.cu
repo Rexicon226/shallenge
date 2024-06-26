@@ -9,8 +9,8 @@
 #include "sha256.cuh"
 
 #define BLOCK_SIZE 256
-#define GRID_SIZE 4096
-#define ITEMS_PER_THREAD 1024
+#define GRID_SIZE 65536
+#define ITEMS_PER_THREAD 256
 
 #define GPU_COUNT 8
 
@@ -76,7 +76,7 @@ __global__ void kernel(int device_id, int epoch, uint64_t *d_totalHash,
 
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             if (s_totalHash[threadIdx.x + s] < s_totalHash[threadIdx.x]) {
                 s_totalHash[threadIdx.x] = s_totalHash[threadIdx.x + s];
@@ -95,7 +95,7 @@ __global__ void kernel(int device_id, int epoch, uint64_t *d_totalHash,
 }
 
 int main() {
-    printf("number of GPUs: %d\n", GPU_COUNT);
+    printf("Number of GPUs: %d\n", GPU_COUNT);
 
     uint64_t *d_totalHash[GPU_COUNT];
 
@@ -120,7 +120,7 @@ int main() {
     }
 
     int epoch = 0;
-    while (epoch < 2) {
+    while (true) {
         auto start = std::chrono::high_resolution_clock::now();
 
         for (unsigned int device_id = 0; device_id < GPU_COUNT; device_id++) {
@@ -130,6 +130,7 @@ int main() {
                 d_inputString1[device_id], d_inputString2[device_id]);
             epoch++;
         }
+
         for (unsigned int device_id = 0; device_id < GPU_COUNT; device_id++) {
             cudaSetDevice(device_id);
             cudaDeviceSynchronize();
@@ -138,12 +139,6 @@ int main() {
         auto end = std::chrono::high_resolution_clock::now();
         double elapsedMillis =
             std::chrono::duration<double, std::milli>(end - start).count();
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
-            exit(-1);
-        }
 
         float hashes =
             (float)GRID_SIZE * BLOCK_SIZE * ITEMS_PER_THREAD * GPU_COUNT;
@@ -175,12 +170,11 @@ int main() {
 
         // update all d_totalHashes for the current best hash
         for (unsigned int device_id = 0; device_id < GPU_COUNT; device_id++) {
-            cudaMemcpy(&current_totalHash, d_totalHash[device_id],
+            cudaMemcpy(d_totalHash[device_id], &current_totalHash,
                        sizeof(uint64_t), cudaMemcpyHostToDevice);
         }
 
-        char input[36];
-
+        char input[128];
         int smallest_epoch = (int)(current_inputString2 & 0xFFFFFFFF);
         int threadIdx = (int)((current_inputString2 >> 32) & 0xFFFFFFFF);
         int blockIdx = (int)((current_inputString1 & 0xFFFFFFFF));
@@ -188,11 +182,12 @@ int main() {
 
         input_string(smallest_epoch, threadIdx, blockIdx, seed, input);
 
-        printf("epoch %d: | ", smallest_epoch);
+        printf("epoch %d: | ", epoch);
         printf("| %016lx | %s\n", current_totalHash, input);
 
-        printf("elapsed time: %f\n", elapsedMillis);
+        if (current_totalHash == 0) break;
 
+        printf("elapsed time: %f\n", elapsedMillis);
         fflush(stdout);
     }
 

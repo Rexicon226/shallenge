@@ -126,8 +126,8 @@ __device__ void sha256_init(SHA256_CTX *ctx) {
     ctx->state[7] = 0x5be0cd19;
 }
 
-__device__ void sha256_updateUnrolled(SHA256_CTX *ctx, const BYTE data[]) {
-    for (WORD i = 0; i < 35; ++i) {
+__device__ void sha256_update(SHA256_CTX *ctx, const BYTE data[], int len) {
+    for (WORD i = 0; i < len; ++i) {
         // ctx->data == message 512 bit chunk
         ctx->data[ctx->datalen] = data[i];
         ctx->datalen++;
